@@ -1,0 +1,8 @@
+credentials.json
+credentials_web.json
+token.json
+*.ics
+config.env
+*.log
+__pycache__/
+.venv/
