@@ -411,17 +411,15 @@ class CalendarSync:
                         event_data['event_type'] = 'master_recurring'
                         recurrence_event_ids.append(event_data['uid'])
                         logger.debug(f"Found master recurring event: '{event_data['summary']}' with UID: {event_data['uid']}")
-                    elif event_data['uid'] in recurrence_event_ids:
-                        # Follow-up instance of recurring event (no RRULE but UID matches a master)
+                    # elif event_data['uid'] in recurrence_event_ids:
+                    elif event_data['recurrence_id']:
+                        # Follow-up instance of recurring event (has recurrence-id and without RRULE)
                         event_data['event_type'] = 'recurring_instance'
                         logger.debug(f"Found recurring event instance: '{event_data['summary']}' with UID: {event_data['uid']}")
                     else:
                         # Normal event
                         event_data['event_type'] = 'normal'
                         logger.debug(f"Found normal event: '{event_data['summary']}'")
-                    
-                    if event_data['recurrence_id'] and event_data['event_type'] == 'normal':
-                        event_data['uid'] = str(uuid.uuid4())
                     
                     events.append(event_data)
             
@@ -558,46 +556,75 @@ class CalendarSync:
         # Get all existing events from the calendar for delta comparison
         logger.info("Fetching existing events for delta sync...")
         existing_events = self.get_existing_events()
-        existing_events_map = {event.get('iCalUID', ''): event for event in existing_events if event.get('iCalUID')}
+        existing_events_map = {}
+        for event in existing_events:
+            if event.get('iCalUID') in existing_events_map:
+                existing_events_map[event.get('iCalUID')].append(event)
+            else:
+                existing_events_map[event.get('iCalUID')] = [event]
+            if event.get('summary') == 'test':
+                print("Existing event: ", event)
         existing_uids = set(existing_events_map.keys())
+        
+        # Deal with recurring events
+        # Find master recurring events in existing events for all recurring instances
+        # If no existing master recurring event, find a master recurring event in the new events
+        # If no master recurring event in the new events, set the event type to dangling_recurring_instance
+        for event_data in events:
+            if event_data.get('event_type') == 'recurring_instance':
+                # Check if the UID exists in existing events before accessing
+                if event_data.get('uid') in existing_events_map:
+                    for existing_event in existing_events_map[event_data.get('uid')]:
+                        if existing_event.get('recurrence'):
+                            event_data['master_recurring_event'] = existing_event
+                            break
+                
+                if event_data.get('master_recurring_event') is None:
+                    event_data['event_type'] = 'dangling_recurring_instance'
+                    for new_event in events:
+                        if new_event.get('event_type') == 'master_recurring' and new_event.get('uid') == event_data.get('uid'):
+                            event_data['event_type'] = 'recurring_instance'
+                            event_data['master_recurring_event'] = new_event
+                            break
+
+            if event_data.get('event_type') == 'dangling_recurring_instance':
+                event_data['event_type'] = 'normal'
+                event_data['uid'] = str(uuid.uuid4())
+            
+            assert(event_data['event_type'] in ['recurring_instance', 'master_recurring', 'normal'])
+            # Only assert master_recurring_event for recurring instances
+            if event_data['event_type'] == 'recurring_instance':
+                assert(event_data.get('master_recurring_event') is not None)
         
         # Get UIDs from the new events (filter out empty UIDs)
         new_uids = {event_data.get('uid', '') for event_data in events if event_data.get('uid') and event_data.get('uid').strip()}
-        
+
         logger.debug(f"Existing UIDs count: {len(existing_uids)}")
         logger.debug(f"New UIDs count: {len(new_uids)}")
         
-        # Debug: Show sample UIDs to identify potential issues
-        if self.debug_comparison and existing_uids:
-            sample_uids = list(existing_uids)[:3]
-            logger.debug(f"Sample existing UIDs: {sample_uids}")
-        
         # Handle event deletion if enabled
-        if self.enable_deletion:
-            # Find events to delete (exist in calendar but not in new ICS file)
-            events_to_delete = existing_uids - new_uids
+        # Find events to delete (exist in calendar but not in new ICS file)
+        events_to_delete = existing_uids - new_uids
             
-            logger.debug(f"Events to delete: {len(events_to_delete)}")
-            if events_to_delete and self.debug_comparison:
-                logger.info(f"Events to delete (UIDs): {list(events_to_delete)[:5]}...")  # Show first 5 for debugging
+        logger.debug(f"Events to delete: {len(events_to_delete)}")
+        if events_to_delete and self.debug_comparison:
+            logger.info(f"Events to delete (UIDs): {list(events_to_delete)[:5]}...")  # Show first 5 for debugging
             
-            if events_to_delete:
-                if self.dry_run:
-                    logger.info(f"[DRY RUN] Found {len(events_to_delete)} events that would be deleted")
-                    if self.debug_comparison:
-                        logger.info(f"[DRY RUN] Events to delete: {list(events_to_delete)}")
-                    deleted_count = len(events_to_delete)  # Count as if deleted for dry run
-                else:
-                    logger.info(f"Found {len(events_to_delete)} events to delete")
-                    for uid in events_to_delete:
-                        if self.delete_event_by_uid(uid, existing_events_map):
-                            deleted_count += 1
-                        else:
-                            logger.warning(f"Failed to delete event with UID: {uid}")
+        if events_to_delete:
+            if self.dry_run:
+                logger.info(f"[DRY RUN] Found {len(events_to_delete)} events that would be deleted")
+                if self.debug_comparison:
+                    logger.info(f"[DRY RUN] Events to delete: {list(events_to_delete)}")
+                deleted_count = len(events_to_delete)  # Count as if deleted for dry run
             else:
-                logger.info("No events to delete")
+                logger.info(f"Found {len(events_to_delete)} events to delete")
+                for uid in events_to_delete:
+                    if self.delete_event_by_uid(uid, existing_events_map):
+                        deleted_count += 1
+                    else:
+                        logger.warning(f"Failed to delete event with UID: {uid}")
         else:
-            logger.info("Event deletion is disabled - only adding/updating events")
+            logger.info("No events to delete")
         
         # Process events for delta sync
         logger.info("Processing events for delta sync...")
@@ -605,22 +632,29 @@ class CalendarSync:
         events_to_update = []
         
         for event_data in events:
-            uid = event_data.get('uid', '')
-            if not uid:
-                # Events without UID always get inserted
+            if event_data.get('uid') not in existing_events_map or not event_data.get('uid'):
                 events_to_insert.append(event_data)
                 continue
-            
-            if uid in existing_events_map:
-                # Event exists - check if it needs updating
-                existing_event = existing_events_map[uid]
+            if event_data['event_type'] == 'recurring_instance' and event_data['master_recurring_event'].get('id') is None and event_data['uid'] in existing_events_map:
+                logger.warning(f"Skipping update or insert for recurring instance {event_data.get('summary')} because its ID is in existing events map but no master recurring event found in existing events map")
+                if event_data['summary'] == 'test':
+                    print(event_data)
+                continue
+
+            if event_data.get('event_type') == 'recurring_instance':
+                assert(event_data['master_recurring_event'] is not None)
+                if self.recurring_event_needs_update(event_data, existing_events_map):
+                    events_to_update.append((event_data, event_data['master_recurring_event']))
+            elif event_data.get('event_type') == 'master_recurring':
+                if self.recurring_master_needs_update(event_data, existing_events_map):
+                    events_to_update.append((event_data, event_data['existing_master_event']))
+            else:
+                assert(len(existing_events_map[event_data.get('uid')]) == 1)
+                existing_event = existing_events_map[event_data.get('uid')][0]
                 if self.event_needs_update(event_data, existing_event):
                     events_to_update.append((event_data, existing_event))
                 else:
                     skipped_count += 1
-            else:
-                # New event - needs to be inserted
-                events_to_insert.append(event_data)
         
         logger.info(f"Delta sync: {len(events_to_insert)} to insert, {len(events_to_update)} to update, {skipped_count} unchanged")
         
@@ -637,15 +671,18 @@ class CalendarSync:
                 error_count += 1
         
         # Process events to update (changed events)
+        print("!!!!! here2 !!!!!")
         for event_data, existing_event in events_to_update:
             try:
-                if self.update_event(event_data):
+                print("!!!!! here3 !!!!!")
+                if self.update_event(event_data, existing_event):
                     updated_count += 1
                 else:
                     error_count += 1
             except Exception as e:
                 logger.error(f"Unexpected error updating event '{event_data['summary']}': {e}")
                 error_count += 1
+        print("!!!!! here4 !!!!!")
         
         logger.info(f"Delta sync completed: {imported_count} inserted, {updated_count} updated, {skipped_count} unchanged, {deleted_count} deleted, {error_count} errors")
     
@@ -656,8 +693,6 @@ class CalendarSync:
             events_result = self.service.events().list(
                 calendarId=self.calendar_id,
                 maxResults=2500,  # Google Calendar API limit
-                singleEvents=True,
-                orderBy='startTime'
             ).execute()
             
             events = events_result.get('items', [])
@@ -681,9 +716,14 @@ class CalendarSync:
             
             # First try to find the event in the existing events map (more reliable)
             if existing_events_map and uid in existing_events_map:
-                event = existing_events_map[uid]
-                event_id = event['id']
-                logger.debug(f"Found event in existing events map: '{event.get('summary', 'Untitled')}' (ID: {event_id})")
+                events_list = existing_events_map[uid]
+                if events_list:
+                    event = events_list[0]  # Get the first event from the list
+                    event_id = event['id']
+                    logger.debug(f"Found event in existing events map: '{event.get('summary', 'Untitled')}' (ID: {event_id})")
+                else:
+                    logger.warning(f"Empty events list for UID {uid}")
+                    return False
             else:
                 # Fallback to API search (less reliable for some UID formats)
                 logger.debug(f"Event not in existing map, trying API search...")
@@ -728,6 +768,45 @@ class CalendarSync:
             logger.error(f"Unexpected error deleting event with UID {uid}: {e}")
             return False
     
+    def recurring_event_needs_update(self, new_event_data: dict, existing_events_map: dict) -> bool:
+        """Check if a recurring event needs updating by comparing key fields."""
+        """For all events with the same UID, start, and end, check if the summary, description, location, or recurrence rule. If new_event_data matches any one existing event, return False."""
+        logger.debug(f"Checking if recurring event {new_event_data.get('summary')} needs updating")
+        for existing_event in existing_events_map[new_event_data.get('uid')]:
+            if not self.event_needs_update(new_event_data, existing_event):
+                logger.debug(f"Recurring event instance {new_event_data.get('summary')} does not need updating, matches existing event {existing_event.get('summary')}")
+                return False
+        logger.debug(f"Recurring event instance {new_event_data.get('summary')} needs updating, does not match any existing event")
+        return True
+    
+    def recurring_master_needs_update(self, new_event_data: dict, existing_events_map: dict) -> bool:
+        """Check if a recurring master event needs updating by comparing key fields."""
+        logger.debug(f"Checking if recurring master event {new_event_data.get('summary')} needs updating")
+        # Check if the existing event is also a recurring event
+        if len(existing_events_map[new_event_data.get('uid')]) == 1 and not existing_events_map[new_event_data.get('uid')][0].get('recurrence'):
+            logger.debug(f"Existing matching event {new_event_data.get('summary')} is not a recurring event")
+            new_event_data['existing_master_event'] = existing_events_map[new_event_data.get('uid')][0]
+            return True
+
+        # Check if the existing event has the same rrule
+        existing_master_event = None
+        for existing_event in existing_events_map[new_event_data.get('uid')]:
+            if existing_event.get('recurrence'):
+                existing_master_event = existing_event
+                break
+        if existing_master_event is None:
+            # TODO: Check why this happens. Just ignore for now.
+            logger.warning(f"Skipping update for recurring master event {new_event_data.get('summary')} because cannot find a matching master recurring event")
+            return False
+
+        new_event_data['existing_master_event'] = existing_master_event
+        if existing_master_event.get('rrule') != new_event_data.get('recurrence'):
+            logger.debug(f"Existing matching event {new_event_data.get('summary')} has a different rrule, {existing_master_event.get('rrule')} -> {new_event_data.get('recurrence')}")
+            return True
+        
+        # Check if the existing event has the same summary, start time, etc.
+        return self.event_needs_update(new_event_data, existing_events_map[new_event_data.get('uid')][0])
+
     def event_needs_update(self, new_event_data: dict, existing_event: dict) -> bool:
         """Check if an event needs updating by comparing key fields."""
         try:
@@ -741,10 +820,7 @@ class CalendarSync:
             new_summary = normalize_str(new_event_data.get('summary'))
             existing_summary = normalize_str(existing_event.get('summary'))
             if new_summary != existing_summary:
-                if self.debug_comparison:
-                    logger.info(f"Summary changed: '{existing_summary}' -> '{new_summary}'")
-                else:
-                    logger.debug(f"Summary changed: '{existing_summary}' -> '{new_summary}'")
+                logger.debug(f"Summary changed: '{existing_summary}' -> '{new_summary}'")
                 return True
             
             # Compare description
@@ -760,50 +836,6 @@ class CalendarSync:
             if new_location != existing_location:
                 logger.debug(f"Location changed: '{existing_location}' -> '{new_location}'")
                 return True
-            
-            # Special handling for recurring events
-            new_is_recurring = new_event_data.get('is_recurring', False)
-            existing_recurrence = existing_event.get('recurrence', [])
-            existing_is_recurring = len(existing_recurrence) > 0
-            
-            # Check if recurrence status changed
-            if new_is_recurring != existing_is_recurring:
-                if self.debug_comparison:
-                    logger.info(f"Recurrence status changed for {new_summary}: {existing_is_recurring} -> {new_is_recurring}")
-                return True
-            
-            # For recurring events, we need to determine if we're comparing the master event or an occurrence
-            if new_is_recurring and existing_is_recurring:
-                # Check if this is the master recurring event (has RRULE) or an individual occurrence
-                new_has_rrule = new_event_data.get('rrule') is not None
-                existing_has_rrule = len(existing_recurrence) > 0
-                
-                if new_has_rrule and existing_has_rrule:
-                    # Both are master recurring events - compare recurrence rules
-                    new_rrule = new_event_data.get('rrule')
-                    if new_rrule:
-                        new_rrule_str = self._format_rrule_for_google(dict(new_rrule))
-                        existing_rrule_str = existing_recurrence[0].replace('RRULE:', '') if existing_recurrence else ''
-                        
-                        if new_rrule_str != existing_rrule_str:
-                            if self.debug_comparison:
-                                logger.info(f"Recurrence rule changed for {new_summary}: '{existing_rrule_str}' -> '{new_rrule_str}'")
-                            return True
-                    
-                    # For master recurring events, also compare the base event properties (summary, description, location)
-                    # but skip time comparison as individual occurrences may have different times
-                    logger.debug(f"Master recurring event comparison completed for: {new_summary}")
-                    return False
-                    
-                elif not new_has_rrule and not existing_has_rrule:
-                    # Both are individual occurrences of recurring events - compare normally
-                    # This will fall through to the time comparison below
-                    logger.debug(f"Comparing individual occurrence of recurring event: {new_summary}")
-                else:
-                    # One is master, one is occurrence - they're different
-                    if self.debug_comparison:
-                        logger.info(f"Recurring event type mismatch for {new_summary}: master vs occurrence")
-                    return True
             
             # Compare start time
             if self._times_different(new_event_data.get('start'), existing_event.get('start')):
@@ -1021,119 +1053,22 @@ class CalendarSync:
             event_type = event_data.get('event_type', 'normal')
             
             if event_type == 'recurring_instance':
-                # Use PATCH for recurring instances
+                # Update recurring instance using PATCH
                 return self._patch_recurring_instance(event_data, existing_event)
-            elif event_data.get('is_recurring'):
-                try:
-                    logger.info(f"Updating recurring event with delete+insert method: {event_data['summary']}")
-                    
-                    # Delete the existing recurring event first
-                    existing_event_id = existing_event['id']
-                    try:
-                        self.service.events().delete(
-                            calendarId=self.calendar_id,
-                            eventId=existing_event_id
-                        ).execute()
-                        logger.debug(f"Deleted existing recurring event: {existing_event_id}")
-                        
-                        # Add a small delay to ensure deletion is processed
-                        import time
-                        time.sleep(0.5)
-                        
-                    except HttpError as delete_error:
-                        logger.warning(f"Failed to delete existing event {existing_event_id}: {delete_error}")
-                        # Continue with insert anyway - it might work if the event is already gone
-                    
-                    # Try to use raw_data first, then fall back to _create_google_event
-                    if event_data.get('raw_data'):
-                        try:
-                            # Use raw_data for import method
-                            import_data = event_data.get('raw_data')
-                            created_event = self.service.events().import_(
-                                calendarId=self.calendar_id,
-                                body=import_data
-                            ).execute()
-                            logger.info(f"Updated recurring event (via delete+import): {event_data['summary']}")
-                            return True
-                        except HttpError as import_error:
-                            if "duplicate" in str(import_error).lower() or "already exists" in str(import_error).lower():
-                                logger.info(f"Event already exists, skipping insert: {event_data['summary']}")
-                                return True  # Consider it successful since the event exists
-                            else:
-                                logger.warning(f"Import with raw iCal data failed, falling back to insert: {import_error}")
-                                # Fallback: Use insert method with created google_event
-                                google_event = self._create_google_event(event_data)
-                                
-                                # If insert fails due to invalid start time, try without recurrence rules
-                                try:
-                                    created_event = self.service.events().insert(
-                                        calendarId=self.calendar_id,
-                                        body=google_event
-                                    ).execute()
-                                    logger.info(f"Updated recurring event (via delete+insert): {event_data['summary']}")
-                                    return True
-                                except HttpError as insert_error:
-                                    if "duplicate" in str(insert_error).lower() or "already exists" in str(insert_error).lower():
-                                        logger.info(f"Event already exists, skipping insert: {event_data['summary']}")
-                                        return True  # Consider it successful since the event exists
-                                    if "Invalid start time" in str(insert_error):
-                                        logger.warning(f"Insert failed due to invalid start time, retrying without recurrence rules: {event_data['summary']}")
-                                        # Remove recurrence rules and try again
-                                        google_event_no_recurrence = google_event.copy()
-                                        if 'recurrence' in google_event_no_recurrence:
-                                            del google_event_no_recurrence['recurrence']
-                                        
-                                        created_event = self.service.events().insert(
-                                            calendarId=self.calendar_id,
-                                            body=google_event_no_recurrence
-                                        ).execute()
-                                        logger.info(f"Updated recurring event without recurrence rules (via delete+insert): {event_data['summary']}")
-                                        return True
-                                    else:
-                                        raise insert_error
-                    
-                    # If no raw_data available, use insert method directly
-                    google_event = self._create_google_event(event_data)
-                    
-                    # If insert fails due to invalid start time, try without recurrence rules
-                    try:
-                        created_event = self.service.events().insert(
-                            calendarId=self.calendar_id,
-                            body=google_event
-                        ).execute()
-                        logger.info(f"Updated recurring event (via delete+insert): {event_data['summary']}")
-                        return True
-                    except HttpError as insert_error:
-                        if "duplicate" in str(insert_error).lower() or "already exists" in str(insert_error).lower():
-                            logger.info(f"Event already exists, skipping insert: {event_data['summary']}")
-                            return True  # Consider it successful since the event exists
-                        if "Invalid start time" in str(insert_error):
-                            logger.warning(f"Insert failed due to invalid start time, retrying without recurrence rules: {event_data['summary']}")
-                            # Remove recurrence rules and try again
-                            google_event_no_recurrence = google_event.copy()
-                            if 'recurrence' in google_event_no_recurrence:
-                                del google_event_no_recurrence['recurrence']
-                            
-                            created_event = self.service.events().insert(
-                                calendarId=self.calendar_id,
-                                body=google_event_no_recurrence
-                            ).execute()
-                            logger.info(f"Updated recurring event without recurrence rules (via delete+insert): {event_data['summary']}")
-                            return True
-                        else:
-                            raise insert_error
-                    
-                except HttpError as delete_insert_error:
-                    logger.warning(f"Delete+insert method failed for recurring event '{event_data['summary']}', falling back to update: {delete_insert_error}")
-                    # Fall back to regular update method
-                except Exception as delete_insert_error:
-                    logger.warning(f"Unexpected error in delete+insert method for recurring event '{event_data['summary']}', falling back to update: {delete_insert_error}")
-                    # Fall back to regular update method
+            else:
+                # Update normal events and master recurring events using update API
+                return self._update_event_with_update_api(event_data, existing_event)
+                
+        except Exception as e:
+            logger.error(f"Unexpected error updating event '{event_data['summary']}': {e}, event_type: {event_type}")
+            return False
+
+    def _update_event_with_update_api(self, event_data: dict, existing_event: dict) -> bool:
+        """Update normal events and master recurring events using update API."""
+        try:
+            logger.info(f"Updating event with update API: {event_data['summary']}")
             
-            # Regular update method for non-recurring events or fallback
             event_id = existing_event['id']
-            
-            # Create the updated event data
             google_event = self._create_google_event(event_data)
             
             # For recurring events, try to handle recurrence rules properly
@@ -1178,7 +1113,7 @@ class CalendarSync:
         except Exception as e:
             logger.error(f"Unexpected error updating event '{event_data['summary']}': {e}")
             return False
-    
+
     def _create_google_event(self, event_data: dict) -> dict:
         """Create a Google Calendar event object from event data."""
         google_event = {
