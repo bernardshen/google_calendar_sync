@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 import requests
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
@@ -23,16 +24,47 @@ import http.cookiejar
 import pytz
 import uuid
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('calendar_sync.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
+# Configure logging with rotation
+def setup_logging(max_bytes=10*1024*1024, backup_count=5, log_file='calendar_sync.log'):
+    """
+    Setup logging with file rotation to prevent large log files.
+    
+    Args:
+        max_bytes: Maximum size of each log file in bytes (default: 10MB)
+        backup_count: Number of backup files to keep (default: 5)
+        log_file: Name of the log file (default: calendar_sync.log)
+    """
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    
+    # Get root logger and clear existing handlers to avoid duplicates
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()  # Remove all existing handlers
+    
+    # Create rotating file handler
+    file_handler = RotatingFileHandler(
+        log_file, 
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+    
+    # Create console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.INFO)
+    
+    # Add handlers to root logger
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+    
+    return logging.getLogger(__name__)
+
+# Setup basic logging first
+logger = setup_logging()
 
 # Google Calendar API scopes
 SCOPES = ['https://www.googleapis.com/auth/calendar']
@@ -96,7 +128,7 @@ def load_cookies_from_file(cookie_file: str = 'cookies.txt') -> Optional[http.co
         return None
 
 class CalendarSync:
-    def __init__(self, ics_url: str, calendar_name: str, credentials_file: str = 'credentials.json', enable_deletion: bool = True, debug_comparison: bool = False, dry_run: bool = False, enable_recurrent_events: bool = True, recurrent_event_mode: str = 'series'):
+    def __init__(self, ics_url: str, calendar_name: str, credentials_file: str = 'credentials.json'):
         """
         Initialize the CalendarSync instance.
         
@@ -104,20 +136,10 @@ class CalendarSync:
             ics_url: URL to download the ICS file from
             calendar_name: Name of the Google Calendar to import events to
             credentials_file: Path to Google OAuth credentials file
-            enable_deletion: Whether to delete events not in the source ICS file
-            debug_comparison: Whether to show detailed comparison logging
-            dry_run: Whether to simulate operations without actually performing them
-            enable_recurrent_events: Whether to handle recurring events properly
-            recurrent_event_mode: How to handle recurring events (single_instance|series|both)
         """
         self.ics_url = ics_url
         self.calendar_name = calendar_name
         self.credentials_file = credentials_file
-        self.enable_deletion = enable_deletion
-        self.debug_comparison = debug_comparison
-        self.dry_run = dry_run
-        self.enable_recurrent_events = enable_recurrent_events
-        self.recurrent_event_mode = recurrent_event_mode
         self.service = None
         self.calendar_id = None
         
@@ -353,6 +375,21 @@ class CalendarSync:
             logger.error(f"Unexpected error downloading ICS file: {e}")
             return None
     
+    def _convert_to_utc(self, dt: datetime) -> datetime:
+        """Convert a datetime to UTC."""
+        if hasattr(dt, 'tzinfo') and dt.tzinfo:
+            return dt.astimezone(pytz.utc)
+        return dt
+    
+    def _convert_component_time_to_utc(self, component):
+        """Convert a component's time to UTC."""
+        if component.get('dtstart') and component.get('dtend'):
+            component.get('dtstart').dt = self._convert_to_utc(component.get('dtstart').dt)
+            component.get('dtend').dt = self._convert_to_utc(component.get('dtend').dt)
+        if component.get('recurrence-id'):
+            component.get('recurrence-id').dt = self._convert_to_utc(component.get('recurrence-id').dt)
+        return component
+
     def parse_ics_file(self, ics_file_path: str) -> list:
         """Parse ICS file and extract events."""
         events = []
@@ -360,85 +397,58 @@ class CalendarSync:
         try:
             with open(ics_file_path, 'rb') as f:
                 calendar = icalendar.Calendar.from_ical(f.read())
-            
-            for component in calendar.walk():
-                if component.name == "VEVENT":
-                    # Fix timezone issue - convert to UTC for Google Calendar API compatibility
-                    if component.get('dtstart') and component.get('dtend'):
-                        start_dt = component.get('dtstart').dt
-                        end_dt = component.get('dtend').dt
-                        
-                        # Convert to UTC if timezone-aware
-                        if hasattr(start_dt, 'tzinfo') and start_dt.tzinfo:
-                            start_dt_utc = start_dt.astimezone(pytz.utc)
-                            end_dt_utc = end_dt.astimezone(pytz.utc)
-                            
-                            # Update the component with UTC times
-                            from icalendar import vDatetime
-                            component['dtstart'] = vDatetime(start_dt_utc)
-                            component['dtend'] = vDatetime(end_dt_utc)
-                            logger.debug(f"Converted times to UTC: {start_dt} -> {start_dt_utc}, {end_dt} -> {end_dt_utc}")
-                    
-                    # Also convert recurrence-id to UTC if present
-                    if component.get('recurrence-id'):
-                        recurrence_dt = component.get('recurrence-id').dt
-                        
-                        # Convert to UTC if timezone-aware
-                        if hasattr(recurrence_dt, 'tzinfo') and recurrence_dt.tzinfo:
-                            recurrence_dt_utc = recurrence_dt.astimezone(pytz.utc)
-                            
-                            # Update the component with UTC time
-                            from icalendar import vDatetime
-                            component['recurrence-id'] = vDatetime(recurrence_dt_utc)
-                            logger.debug(f"Converted recurrence-id to UTC: {recurrence_dt} -> {recurrence_dt_utc}")
-
-                    # Extract basic event data
-                    event_data = {
-                        'summary': str(component.get('summary', '')),
-                        'description': str(component.get('description', '')),
-                        'start': component.get('dtstart'),
-                        'end': component.get('dtend'),
-                        'location': str(component.get('location', '')),
-                        'uid': str(component.get('uid', '')),
-                        'rrule': component.get('rrule'),  # Add recurrence rule support
-                        'recurrence_id': component.get('recurrence-id'),  # For exceptions to recurring events
-                        'is_recurring': bool(component.get('rrule'))  # Flag for recurring events
-                    }
-
-                    # Determine event type and handle accordingly
-                    if event_data['is_recurring']:
-                        # Master recurring event (has RRULE)
-                        event_data['event_type'] = 'master_recurring'
-                        recurrence_event_ids.append(event_data['uid'])
-                        logger.debug(f"Found master recurring event: '{event_data['summary']}' with UID: {event_data['uid']}")
-                    # elif event_data['uid'] in recurrence_event_ids:
-                    elif event_data['recurrence_id']:
-                        # Follow-up instance of recurring event (has recurrence-id and without RRULE)
-                        event_data['event_type'] = 'recurring_instance'
-                        logger.debug(f"Found recurring event instance: '{event_data['summary']}' with UID: {event_data['uid']}")
-                    else:
-                        # Normal event
-                        event_data['event_type'] = 'normal'
-                        logger.debug(f"Found normal event: '{event_data['summary']}'")
-                    
-                    events.append(event_data)
-            
-            # Log event type breakdown
-            master_recurring = sum(1 for event in events if event['event_type'] == 'master_recurring')
-            recurring_instances = sum(1 for event in events if event['event_type'] == 'recurring_instance')
-            normal_events = sum(1 for event in events if event['event_type'] == 'normal')
-            
-            logger.info(f"Parsed {len(events)} events:")
-            logger.info(f"  - {master_recurring} master recurring events")
-            logger.info(f"  - {recurring_instances} recurring event instances")
-            logger.info(f"  - {normal_events} normal events")
-            
-            return events
-            
         except Exception as e:
             logger.error(f"Error parsing ICS file: {e}")
             return []
-    
+            
+        for component in calendar.walk():
+            if component.name == "VEVENT":
+                # Fix timezone issue - convert to UTC for Google Calendar API compatibility
+                component = self._convert_component_time_to_utc(component)
+
+                # Extract basic event data
+                event_data = {
+                    'summary': str(component.get('summary', '')),
+                    'description': str(component.get('description', '')),
+                    'start': component.get('dtstart'),
+                    'end': component.get('dtend'),
+                    'location': str(component.get('location', '')),
+                    'uid': str(component.get('uid', '')),
+                    'rrule': component.get('rrule'),  # Add recurrence rule support
+                    'recurrence_id': component.get('recurrence-id'),  # For exceptions to recurring events
+                    'is_recurring': bool(component.get('rrule'))  # Flag for recurring events
+                }
+
+                # Determine event type and handle accordingly
+                if event_data['is_recurring']:
+                    # Master recurring event (has RRULE)
+                    event_data['event_type'] = 'master_recurring'
+                    recurrence_event_ids.append(event_data['uid'])
+                    logger.debug(f"Found master recurring event: '{event_data['summary']}' with UID: {event_data['uid']}")
+                # elif event_data['uid'] in recurrence_event_ids:
+                elif event_data['recurrence_id']:
+                    # Follow-up instance of recurring event (has recurrence-id and without RRULE)
+                    event_data['event_type'] = 'recurring_instance'
+                    logger.debug(f"Found recurring event instance: '{event_data['summary']}' with UID: {event_data['uid']}")
+                else:
+                    # Normal event
+                    event_data['event_type'] = 'normal'
+                    logger.debug(f"Found normal event: '{event_data['summary']}'")
+                
+                events.append(event_data)
+            
+        # Log event type breakdown
+        master_recurring = sum(1 for event in events if event['event_type'] == 'master_recurring')
+        recurring_instances = sum(1 for event in events if event['event_type'] == 'recurring_instance')
+        normal_events = sum(1 for event in events if event['event_type'] == 'normal')
+            
+        logger.info(f"Parsed {len(events)} events:")
+        logger.info(f"  - {master_recurring} master recurring events")
+        logger.info(f"  - {recurring_instances} recurring event instances")
+        logger.info(f"  - {normal_events} normal events")
+            
+        return events
+            
     def _format_rrule_for_google(self, rrule_dict: dict) -> str:
         """Convert RRULE dict to Google Calendar format."""
         try:
@@ -541,31 +551,7 @@ class CalendarSync:
                 return f"FREQ={freq}"
             return "FREQ=WEEKLY"
     
-    def import_events_to_calendar(self, events: list):
-        """Import events to Google Calendar using delta-based sync for efficiency."""
-        if not events:
-            logger.info("No events to import")
-            return
-        
-        imported_count = 0
-        updated_count = 0
-        skipped_count = 0
-        error_count = 0
-        deleted_count = 0
-        
-        # Get all existing events from the calendar for delta comparison
-        logger.info("Fetching existing events for delta sync...")
-        existing_events = self.get_existing_events()
-        existing_events_map = {}
-        for event in existing_events:
-            if event.get('iCalUID') in existing_events_map:
-                existing_events_map[event.get('iCalUID')].append(event)
-            else:
-                existing_events_map[event.get('iCalUID')] = [event]
-            if event.get('summary') == 'test':
-                print("Existing event: ", event)
-        existing_uids = set(existing_events_map.keys())
-        
+    def _deal_with_recurring_events(self, events: list, existing_events_map: dict):
         # Deal with recurring events
         # Find master recurring events in existing events for all recurring instances
         # If no existing master recurring event, find a master recurring event in the new events
@@ -595,6 +581,32 @@ class CalendarSync:
             # Only assert master_recurring_event for recurring instances
             if event_data['event_type'] == 'recurring_instance':
                 assert(event_data.get('master_recurring_event') is not None)
+
+    def import_events_to_calendar(self, events: list):
+        """Import events to Google Calendar using delta-based sync for efficiency."""
+        if not events:
+            logger.info("No events to import")
+            return
+        
+        imported_count = 0
+        updated_count = 0
+        skipped_count = 0
+        error_count = 0
+        deleted_count = 0
+        
+        # Get all existing events from the calendar for delta comparison
+        logger.info("Fetching existing events for delta sync...")
+        existing_events = self.get_existing_events()
+        existing_events_map = {}
+        for event in existing_events:
+            if event.get('iCalUID') in existing_events_map:
+                existing_events_map[event.get('iCalUID')].append(event)
+            else:
+                existing_events_map[event.get('iCalUID')] = [event]
+        existing_uids = set(existing_events_map.keys())
+        
+        # Deal with recurring events
+        self._deal_with_recurring_events(events, existing_events_map)
         
         # Get UIDs from the new events (filter out empty UIDs)
         new_uids = {event_data.get('uid', '') for event_data in events if event_data.get('uid') and event_data.get('uid').strip()}
@@ -602,29 +614,14 @@ class CalendarSync:
         logger.debug(f"Existing UIDs count: {len(existing_uids)}")
         logger.debug(f"New UIDs count: {len(new_uids)}")
         
-        # Handle event deletion if enabled
         # Find events to delete (exist in calendar but not in new ICS file)
         events_to_delete = existing_uids - new_uids
-            
-        logger.debug(f"Events to delete: {len(events_to_delete)}")
-        if events_to_delete and self.debug_comparison:
-            logger.info(f"Events to delete (UIDs): {list(events_to_delete)[:5]}...")  # Show first 5 for debugging
-            
-        if events_to_delete:
-            if self.dry_run:
-                logger.info(f"[DRY RUN] Found {len(events_to_delete)} events that would be deleted")
-                if self.debug_comparison:
-                    logger.info(f"[DRY RUN] Events to delete: {list(events_to_delete)}")
-                deleted_count = len(events_to_delete)  # Count as if deleted for dry run
+        logger.info(f"Found {len(events_to_delete)} events to delete")
+        for uid in events_to_delete:
+            if self.delete_event_by_uid(uid, existing_events_map):
+                deleted_count += 1
             else:
-                logger.info(f"Found {len(events_to_delete)} events to delete")
-                for uid in events_to_delete:
-                    if self.delete_event_by_uid(uid, existing_events_map):
-                        deleted_count += 1
-                    else:
-                        logger.warning(f"Failed to delete event with UID: {uid}")
-        else:
-            logger.info("No events to delete")
+                logger.warning(f"Failed to delete event with UID: {uid}")
         
         # Process events for delta sync
         logger.info("Processing events for delta sync...")
@@ -635,15 +632,10 @@ class CalendarSync:
             if event_data.get('uid') not in existing_events_map or not event_data.get('uid'):
                 events_to_insert.append(event_data)
                 continue
-            if event_data['event_type'] == 'recurring_instance' and event_data['master_recurring_event'].get('id') is None and event_data['uid'] in existing_events_map:
-                logger.warning(f"Skipping update or insert for recurring instance {event_data.get('summary')} because its ID is in existing events map but no master recurring event found in existing events map")
-                if event_data['summary'] == 'test':
-                    print(event_data)
-                continue
 
             if event_data.get('event_type') == 'recurring_instance':
                 assert(event_data['master_recurring_event'] is not None)
-                if self.recurring_event_needs_update(event_data, existing_events_map):
+                if self.recurring_instance_needs_update(event_data, existing_events_map):
                     events_to_update.append((event_data, event_data['master_recurring_event']))
             elif event_data.get('event_type') == 'master_recurring':
                 if self.recurring_master_needs_update(event_data, existing_events_map):
@@ -651,7 +643,7 @@ class CalendarSync:
             else:
                 assert(len(existing_events_map[event_data.get('uid')]) == 1)
                 existing_event = existing_events_map[event_data.get('uid')][0]
-                if self.event_needs_update(event_data, existing_event):
+                if self.normal_event_needs_update(event_data, existing_event):
                     events_to_update.append((event_data, existing_event))
                 else:
                     skipped_count += 1
@@ -671,10 +663,8 @@ class CalendarSync:
                 error_count += 1
         
         # Process events to update (changed events)
-        print("!!!!! here2 !!!!!")
         for event_data, existing_event in events_to_update:
             try:
-                print("!!!!! here3 !!!!!")
                 if self.update_event(event_data, existing_event):
                     updated_count += 1
                 else:
@@ -682,7 +672,6 @@ class CalendarSync:
             except Exception as e:
                 logger.error(f"Unexpected error updating event '{event_data['summary']}': {e}")
                 error_count += 1
-        print("!!!!! here4 !!!!!")
         
         logger.info(f"Delta sync completed: {imported_count} inserted, {updated_count} updated, {skipped_count} unchanged, {deleted_count} deleted, {error_count} errors")
     
@@ -768,23 +757,23 @@ class CalendarSync:
             logger.error(f"Unexpected error deleting event with UID {uid}: {e}")
             return False
     
-    def recurring_event_needs_update(self, new_event_data: dict, existing_events_map: dict) -> bool:
+    def recurring_instance_needs_update(self, new_event_data: dict, existing_events_map: dict) -> bool:
         """Check if a recurring event needs updating by comparing key fields."""
         """For all events with the same UID, start, and end, check if the summary, description, location, or recurrence rule. If new_event_data matches any one existing event, return False."""
-        logger.debug(f"Checking if recurring event {new_event_data.get('summary')} needs updating")
+        logger.info(f"Checking if recurring event {new_event_data.get('summary')} needs updating")
         for existing_event in existing_events_map[new_event_data.get('uid')]:
-            if not self.event_needs_update(new_event_data, existing_event):
-                logger.debug(f"Recurring event instance {new_event_data.get('summary')} does not need updating, matches existing event {existing_event.get('summary')}")
+            if not self.normal_event_needs_update(new_event_data, existing_event):
+                logger.info(f"Recurring event instance {new_event_data.get('summary')} does not need updating, matches existing event {existing_event.get('summary')}")
                 return False
-        logger.debug(f"Recurring event instance {new_event_data.get('summary')} needs updating, does not match any existing event")
+        logger.info(f"Recurring event instance {new_event_data.get('summary')} needs updating, does not match any existing event")
         return True
     
     def recurring_master_needs_update(self, new_event_data: dict, existing_events_map: dict) -> bool:
         """Check if a recurring master event needs updating by comparing key fields."""
-        logger.debug(f"Checking if recurring master event {new_event_data.get('summary')} needs updating")
+        logger.info(f"Checking if recurring master event {new_event_data.get('summary')} needs updating")
         # Check if the existing event is also a recurring event
         if len(existing_events_map[new_event_data.get('uid')]) == 1 and not existing_events_map[new_event_data.get('uid')][0].get('recurrence'):
-            logger.debug(f"Existing matching event {new_event_data.get('summary')} is not a recurring event")
+            logger.info(f"Existing matching event {new_event_data.get('summary')} is not a recurring event")
             new_event_data['existing_master_event'] = existing_events_map[new_event_data.get('uid')][0]
             return True
 
@@ -794,20 +783,20 @@ class CalendarSync:
             if existing_event.get('recurrence'):
                 existing_master_event = existing_event
                 break
-        if existing_master_event is None:
-            # TODO: Check why this happens. Just ignore for now.
-            logger.warning(f"Skipping update for recurring master event {new_event_data.get('summary')} because cannot find a matching master recurring event")
-            return False
 
         new_event_data['existing_master_event'] = existing_master_event
         if existing_master_event.get('rrule') != new_event_data.get('recurrence'):
-            logger.debug(f"Existing matching event {new_event_data.get('summary')} has a different rrule, {existing_master_event.get('rrule')} -> {new_event_data.get('recurrence')}")
+            logger.info(f"Existing matching event {new_event_data.get('summary')} has a different rrule, {existing_master_event.get('rrule')} -> {new_event_data.get('recurrence')}")
             return True
         
         # Check if the existing event has the same summary, start time, etc.
-        return self.event_needs_update(new_event_data, existing_events_map[new_event_data.get('uid')][0])
+        if self.normal_event_needs_update(new_event_data, existing_master_event):
+            logger.info(f"Recurrent master event needs updating, {new_event_data.get('summary')} -> {existing_master_event.get('summary')}")
+            return True
+        logger.info(f"Recurrent master event does not need updating, {new_event_data.get('summary')} -> {existing_master_event.get('summary')}")
+        return False
 
-    def event_needs_update(self, new_event_data: dict, existing_event: dict) -> bool:
+    def normal_event_needs_update(self, new_event_data: dict, existing_event: dict) -> bool:
         """Check if an event needs updating by comparing key fields."""
         try:
             # Normalize strings for comparison (strip whitespace, handle None)
@@ -820,34 +809,34 @@ class CalendarSync:
             new_summary = normalize_str(new_event_data.get('summary'))
             existing_summary = normalize_str(existing_event.get('summary'))
             if new_summary != existing_summary:
-                logger.debug(f"Summary changed: '{existing_summary}' -> '{new_summary}'")
+                logger.info(f"Summary changed: '{existing_summary}' -> '{new_summary}'")
                 return True
             
             # Compare description
             new_description = normalize_str(new_event_data.get('description'))
             existing_description = normalize_str(existing_event.get('description'))
             if new_description != existing_description:
-                logger.debug(f"Description changed: '{existing_description}' -> '{new_description}'")
+                logger.info(f"Description changed: '{existing_description}' -> '{new_description}'")
                 return True
             
             # Compare location
             new_location = normalize_str(new_event_data.get('location'))
             existing_location = normalize_str(existing_event.get('location'))
             if new_location != existing_location:
-                logger.debug(f"Location changed: '{existing_location}' -> '{new_location}'")
+                logger.info(f"Location changed: '{existing_location}' -> '{new_location}'")
                 return True
             
             # Compare start time
             if self._times_different(new_event_data.get('start'), existing_event.get('start')):
-                logger.debug(f"Start time changed for {new_summary}")
+                logger.info(f"Start time changed for {new_summary}")
                 return True
             
             # Compare end time
             if self._times_different(new_event_data.get('end'), existing_event.get('end')):
-                logger.debug(f"End time changed for {new_summary}")
+                logger.info(f"End time changed for {new_summary}")
                 return True
             
-            logger.debug(f"No changes detected for {new_summary}")
+            logger.info(f"No changes detected for {new_summary}")
             return False
             
         except Exception as e:
@@ -1087,29 +1076,8 @@ class CalendarSync:
             
         except HttpError as error:
             logger.error(f"Error updating event '{event_data['summary']}': {error}")
-            
-            # If it's an invalid start time error for recurring events, try without recurrence
-            if ("Invalid start time" in str(error) and 
-                event_data.get('is_recurring') and 
-                'recurrence' in google_event):
-                logger.info(f"Retrying update without recurrence rules for: {event_data['summary']}")
-                try:
-                    # Remove recurrence rules and try again
-                    google_event_without_recurrence = google_event.copy()
-                    del google_event_without_recurrence['recurrence']
-                    
-                    updated_event = self.service.events().update(
-                        calendarId=self.calendar_id,
-                        eventId=event_id,
-                        body=google_event_without_recurrence
-                    ).execute()
-                    
-                    logger.info(f"Updated event without recurrence rules: {event_data['summary']}")
-                    return True
-                except Exception as retry_error:
-                    logger.error(f"Retry without recurrence also failed for '{event_data['summary']}': {retry_error}")
-            
             return False
+
         except Exception as e:
             logger.error(f"Unexpected error updating event '{event_data['summary']}': {e}")
             return False
@@ -1200,9 +1168,7 @@ class CalendarSync:
                         # Continue without end time
         
         # Handle recurrence rules for recurring events
-        if (self.enable_recurrent_events and 
-            event_data.get('is_recurring') and 
-            event_data.get('rrule')):
+        if event_data.get('is_recurring') and event_data.get('rrule'):
             try:
                 # Convert RRULE to Google Calendar format
                 rrule_dict = dict(event_data['rrule'])
@@ -1211,8 +1177,6 @@ class CalendarSync:
                 logger.debug(f"Added recurrence rule to google_event: {google_event['recurrence']}")
             except Exception as e:
                 logger.warning(f"Error adding recurrence rule to event '{event_data['summary']}': {e}")
-        elif event_data.get('is_recurring') and not self.enable_recurrent_events:
-            logger.info(f"Recurrence disabled - treating '{event_data['summary']}' as single event")
         
         return google_event
     
@@ -1265,16 +1229,22 @@ def main():
     CREDENTIALS_FILE = config.get('CREDENTIALS_FILE') or os.getenv('CREDENTIALS_FILE', 'credentials.json')
     SYNC_INTERVAL = int(config.get('SYNC_INTERVAL') or os.getenv('SYNC_INTERVAL', '1'))
     DEBUG_MODE = config.get('DEBUG_MODE', '').lower() == 'true' or os.getenv('DEBUG_MODE', '').lower() == 'true'
-    ENABLE_EVENT_DELETION = config.get('ENABLE_EVENT_DELETION', '').lower() != 'false'  # Default to true
-    DEBUG_COMPARISON = config.get('DEBUG_COMPARISON', '').lower() == 'true' or os.getenv('DEBUG_COMPARISON', '').lower() == 'true'
-    DRY_RUN = config.get('DRY_RUN', '').lower() == 'true' or os.getenv('DRY_RUN', '').lower() == 'true'
-    ENABLE_RECURRENT_EVENTS = config.get('ENABLE_RECURRENT_EVENTS', '').lower() != 'false'  # Default to true
-    RECURRENT_EVENT_MODE = config.get('RECURRENT_EVENT_MODE') or os.getenv('RECURRENT_EVENT_MODE', 'series')
+    
+    # Log rotation configuration
+    LOG_MAX_BYTES = int(config.get('LOG_MAX_BYTES') or os.getenv('LOG_MAX_BYTES', '10485760'))  # 10MB default
+    LOG_BACKUP_COUNT = int(config.get('LOG_BACKUP_COUNT') or os.getenv('LOG_BACKUP_COUNT', '5'))
+    LOG_FILE = config.get('LOG_FILE') or os.getenv('LOG_FILE', 'calendar_sync.log')
+    
+    # Reconfigure logging with rotation settings
+    global logger
+    logger = setup_logging(max_bytes=LOG_MAX_BYTES, backup_count=LOG_BACKUP_COUNT, log_file=LOG_FILE)
     
     # Set debug logging if enabled
     if DEBUG_MODE:
         logging.getLogger().setLevel(logging.DEBUG)
         logger.info("Debug mode enabled - detailed logging active")
+    
+    logger.info(f"Log rotation configured: max {LOG_MAX_BYTES} bytes, {LOG_BACKUP_COUNT} backup files")
     
     if ICS_URL == 'https://example.com/calendar.ics':
         logger.error("Please set the ICS_URL in config.env or as an environment variable")
@@ -1284,13 +1254,9 @@ def main():
     logger.info(f"Target calendar: {CALENDAR_NAME}")
     logger.info(f"Sync interval: {SYNC_INTERVAL} minute(s)")
     logger.info(f"Debug mode: {'enabled' if DEBUG_MODE else 'disabled'}")
-    logger.info(f"Event deletion: {'enabled' if ENABLE_EVENT_DELETION else 'disabled'}")
-    logger.info(f"Dry run mode: {'enabled' if DRY_RUN else 'disabled'}")
-    logger.info(f"Recurrent events: {'enabled' if ENABLE_RECURRENT_EVENTS else 'disabled'}")
-    logger.info(f"Recurrent event mode: {RECURRENT_EVENT_MODE}")
     
     try:
-        sync = CalendarSync(ICS_URL, CALENDAR_NAME, CREDENTIALS_FILE, ENABLE_EVENT_DELETION, DEBUG_COMPARISON, DRY_RUN, ENABLE_RECURRENT_EVENTS, RECURRENT_EVENT_MODE)
+        sync = CalendarSync(ICS_URL, CALENDAR_NAME, CREDENTIALS_FILE)
         sync.authenticate_google_calendar()
         sync.find_or_create_calendar()
         sync.run_continuous_sync(SYNC_INTERVAL)
