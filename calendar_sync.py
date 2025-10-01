@@ -144,19 +144,38 @@ class CalendarSync:
         self.calendar_id = None
         
     def authenticate_google_calendar(self):
-        """Authenticate with Google Calendar API."""
+        """Authenticate with Google Calendar API with automatic token refresh."""
         creds = None
         token_file = 'token.json'
         
         # Load existing token
         if os.path.exists(token_file):
-            creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+            try:
+                creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+                logger.debug("Loaded existing credentials from token file")
+            except Exception as e:
+                logger.warning(f"Error loading existing credentials: {e}")
+                creds = None
         
         # If there are no (valid) credentials available, let the user log in
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
+                try:
+                    logger.info("Token expired, attempting automatic refresh...")
+                    creds.refresh(Request())
+                    logger.info("Successfully refreshed token automatically")
+                    
+                    # Save the refreshed credentials
+                    with open(token_file, 'w') as token:
+                        token.write(creds.to_json())
+                    logger.debug("Saved refreshed credentials to token file")
+                    
+                except Exception as refresh_error:
+                    logger.warning(f"Automatic token refresh failed: {refresh_error}")
+                    logger.info("Will attempt to re-authenticate...")
+                    creds = None
+            
+            if not creds or not creds.valid:
                 if not os.path.exists(self.credentials_file):
                     raise FileNotFoundError(
                         f"Credentials file '{self.credentials_file}' not found. "
@@ -199,8 +218,10 @@ class CalendarSync:
             # Save the credentials for the next run
             with open(token_file, 'w') as token:
                 token.write(creds.to_json())
+            logger.info("Saved new credentials to token file")
         
         self.service = build('calendar', 'v3', credentials=creds)
+        self.creds = creds  # Store credentials for potential refresh
         logger.info("Successfully authenticated with Google Calendar API")
     
     def _print_oauth_setup_instructions(self):
@@ -227,12 +248,58 @@ class CalendarSync:
         print("After making changes, wait a few minutes and try again.")
         print("="*60)
         print()
+    
+    def _ensure_valid_credentials(self):
+        """Ensure credentials are valid, refresh if necessary."""
+        if not self.creds or not self.creds.valid:
+            logger.info("Credentials invalid, attempting refresh...")
+            if self.creds and self.creds.expired and self.creds.refresh_token:
+                try:
+                    self.creds.refresh(Request())
+                    logger.info("Successfully refreshed credentials")
+                    
+                    # Save refreshed credentials
+                    with open('token.json', 'w') as token:
+                        token.write(self.creds.to_json())
+                    logger.debug("Saved refreshed credentials")
+                    
+                    # Rebuild service with new credentials
+                    self.service = build('calendar', 'v3', credentials=self.creds)
+                    return True
+                    
+                except Exception as e:
+                    logger.error(f"Failed to refresh credentials: {e}")
+                    return False
+            else:
+                logger.error("No valid credentials and no refresh token available")
+                return False
+        return True
+    
+    def _execute_with_retry(self, api_call, *args, **kwargs):
+        """Execute API call with automatic token refresh on 401 errors."""
+        try:
+            return api_call(*args, **kwargs).execute()
+        except HttpError as error:
+            if error.resp.status == 401:  # Unauthorized - token might be expired
+                logger.warning("Received 401 error, attempting to refresh credentials...")
+                if self._ensure_valid_credentials():
+                    # Retry the API call with refreshed credentials
+                    try:
+                        return api_call(*args, **kwargs).execute()
+                    except HttpError as retry_error:
+                        logger.error(f"API call failed even after credential refresh: {retry_error}")
+                        raise retry_error
+                else:
+                    logger.error("Could not refresh credentials, re-authentication required")
+                    raise error
+            else:
+                raise error
         
     def find_or_create_calendar(self):
         """Find existing calendar or create a new one."""
         try:
-            # List existing calendars
-            calendar_list = self.service.calendarList().list().execute()
+            # List existing calendars with retry mechanism
+            calendar_list = self._execute_with_retry(self.service.calendarList().list)
             
             for calendar_item in calendar_list.get('items', []):
                 if calendar_item['summary'] == self.calendar_name:
@@ -247,7 +314,7 @@ class CalendarSync:
                 'description': f'Auto-imported calendar from {self.ics_url}'
             }
             
-            created_calendar = self.service.calendars().insert(body=calendar).execute()
+            created_calendar = self._execute_with_retry(self.service.calendars().insert, body=calendar)
             self.calendar_id = created_calendar['id']
             logger.info(f"Created new calendar: {self.calendar_name}")
             
@@ -389,6 +456,24 @@ class CalendarSync:
         if component.get('recurrence-id'):
             component.get('recurrence-id').dt = self._convert_to_utc(component.get('recurrence-id').dt)
         return component
+    
+    def _get_reasonable_time_range(self) -> tuple:
+        """Get a reasonable time range for fetching events to avoid too many old events.
+        
+        Returns:
+            tuple: (time_min, time_max) as RFC3339 formatted strings
+        """
+        now = datetime.now(pytz.utc)
+        
+        # Look back 1 year and forward 2 years by default
+        time_min = now - timedelta(days=30)
+        time_max = now + timedelta(days=365)
+        
+        # Format as RFC3339
+        time_min_str = time_min.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        time_max_str = time_max.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        
+        return time_min_str, time_max_str
 
     def parse_ics_file(self, ics_file_path: str) -> list:
         """Parse ICS file and extract events."""
@@ -582,7 +667,7 @@ class CalendarSync:
             if event_data['event_type'] == 'recurring_instance':
                 assert(event_data.get('master_recurring_event') is not None)
 
-    def import_events_to_calendar(self, events: list):
+    def import_events_to_calendar(self, events: list, _init: bool = False):
         """Import events to Google Calendar using delta-based sync for efficiency."""
         if not events:
             logger.info("No events to import")
@@ -596,13 +681,22 @@ class CalendarSync:
         
         # Get all existing events from the calendar for delta comparison
         logger.info("Fetching existing events for delta sync...")
-        existing_events = self.get_existing_events()
+        
+        # Use a reasonable time range to avoid fetching too many old events
+        if _init == False:
+            time_min, time_max = self._get_reasonable_time_range()
+        else:
+            time_min, time_max = None, None
+        logger.info(f"Using time range for existing events: {time_min} to {time_max}")
+        
+        existing_events = self.get_existing_events(time_min=time_min, time_max=time_max)
         existing_events_map = {}
         for event in existing_events:
             if event.get('iCalUID') in existing_events_map:
                 existing_events_map[event.get('iCalUID')].append(event)
             else:
                 existing_events_map[event.get('iCalUID')] = [event]
+            print(f"Event {event.get('summary')} has UID {event.get('iCalUID')}")
         existing_uids = set(existing_events_map.keys())
         
         # Deal with recurring events
@@ -629,7 +723,26 @@ class CalendarSync:
         events_to_update = []
         
         for event_data in events:
-            if event_data.get('uid') not in existing_events_map or not event_data.get('uid'):
+            # skip if event does not happen in the time range
+            if time_min and event_data.get('start') and _init == False:
+                try:
+                    # Parse the time_min string to get a timezone-aware datetime
+                    time_min_dt = datetime.strptime(time_min, '%Y-%m-%dT%H:%M:%S.%fZ')
+                    time_min_dt = pytz.utc.localize(time_min_dt)
+                    
+                    # Get the event start time and ensure it's timezone-aware
+                    event_start = event_data.get('start').dt
+                    if event_start.tzinfo is None:
+                        event_start = pytz.utc.localize(event_start)
+                    
+                    if event_start < time_min_dt:
+                        logger.info(f"Event {event_data.get('summary')} is before time range, skipping")
+                        continue
+                except Exception as e:
+                    logger.warning(f"Error comparing event time with time range: {e}")
+                    # Continue processing the event if time comparison fails
+            if event_data.get('uid') not in existing_uids or not event_data.get('uid'):
+                print(f"Event {event_data.get('summary')} has no UID or not in existing events map")
                 events_to_insert.append(event_data)
                 continue
 
@@ -675,24 +788,79 @@ class CalendarSync:
         
         logger.info(f"Delta sync completed: {imported_count} inserted, {updated_count} updated, {skipped_count} unchanged, {deleted_count} deleted, {error_count} errors")
     
-    def get_existing_events(self) -> list:
-        """Get all existing events from the calendar."""
+    def get_existing_events(self, time_min: str = None, time_max: str = None) -> list:
+        """Get all existing events from the calendar with proper pagination.
+        
+        Args:
+            time_min: Lower bound (exclusive) for an event's end time to filter by (RFC3339 timestamp)
+            time_max: Upper bound (exclusive) for an event's start time to filter by (RFC3339 timestamp)
+        """
         try:
             logger.debug("Fetching existing events from calendar...")
-            events_result = self.service.events().list(
-                calendarId=self.calendar_id,
-                maxResults=2500,  # Google Calendar API limit
-            ).execute()
+            all_events = []
+            page_token = None
             
-            events = events_result.get('items', [])
-            logger.debug(f"Found {len(events)} existing events in calendar")
-            return events
+            while True:
+                # Build the request parameters
+                request_params = {
+                    'calendarId': self.calendar_id,
+                    'maxResults': 2500,  # Google Calendar API limit per page
+                    'singleEvents': False,  # Keep recurring events as master events with recurrence rules
+                }
+                
+                # Add time range filtering if provided
+                if time_min:
+                    request_params['timeMin'] = time_min
+                if time_max:
+                    request_params['timeMax'] = time_max
+                
+                # Add page token if we have one (for pagination)
+                if page_token:
+                    request_params['pageToken'] = page_token
+                
+                # Execute the API call with detailed logging
+                logger.debug(f"Making API call with parameters: {request_params}")
+                events_result = self._execute_with_retry(
+                    self.service.events().list,
+                    **request_params
+                )
+                
+                # Get events from this page
+                events = events_result.get('items', [])
+                all_events.extend(events)
+                
+                logger.debug(f"Fetched {len(events)} events from page, total so far: {len(all_events)}")
+                
+                # Check if there are more pages
+                page_token = events_result.get('nextPageToken')
+                if not page_token:
+                    break
+                    
+                logger.info("More pages available, continuing pagination...")
+            
+            time_range_info = ""
+            if time_min or time_max:
+                time_range_info = f" (filtered by time range: {time_min or 'no start'} to {time_max or 'no end'})"
+            
+            logger.info(f"Successfully fetched {len(all_events)} total existing events from calendar{time_range_info}")
+            return all_events
             
         except HttpError as error:
-            logger.error(f"Error fetching existing events: {error}")
+            logger.error(f"HTTP error fetching existing events: {error}")
+            if hasattr(error, 'resp') and hasattr(error.resp, 'status'):
+                logger.error(f"HTTP status code: {error.resp.status}")
+                if error.resp.status == 403:
+                    logger.error("Access forbidden - check calendar permissions")
+                elif error.resp.status == 404:
+                    logger.error("Calendar not found - check calendar ID")
+                elif error.resp.status == 401:
+                    logger.error("Authentication failed - check credentials")
             return []
         except Exception as e:
             logger.error(f"Unexpected error fetching existing events: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return []
     
     def delete_event_by_uid(self, uid: str, existing_events_map: dict = None) -> bool:
@@ -716,11 +884,12 @@ class CalendarSync:
             else:
                 # Fallback to API search (less reliable for some UID formats)
                 logger.debug(f"Event not in existing map, trying API search...")
-                events_result = self.service.events().list(
+                events_result = self._execute_with_retry(
+                    self.service.events().list,
                     calendarId=self.calendar_id,
                     q=uid,
                     maxResults=1
-                ).execute()
+                )
                 
                 events = events_result.get('items', [])
                 if not events:
@@ -739,11 +908,12 @@ class CalendarSync:
             event_summary = event.get('summary', 'Untitled Event')
             logger.debug(f"Found event to delete: '{event_summary}' (ID: {event_id})")
             
-            # Delete the event
-            self.service.events().delete(
+            # Delete the event with retry mechanism
+            self._execute_with_retry(
+                self.service.events().delete,
                 calendarId=self.calendar_id,
                 eventId=event_id
-            ).execute()
+            )
             
             logger.info(f"Successfully deleted event: {event_summary}")
             return True
@@ -924,10 +1094,11 @@ class CalendarSync:
         """Insert master recurring event as recurring series."""
         try:
             google_event = self._create_google_event(event_data)
-            created_event = self.service.events().insert(
+            created_event = self._execute_with_retry(
+                self.service.events().insert,
                 calendarId=self.calendar_id,
                 body=google_event
-            ).execute()
+            )
             logger.info(f"Inserted master recurring event: {event_data['summary']}")
             master_recurring_event_map[event_data['uid']] = created_event
             return True
@@ -944,11 +1115,12 @@ class CalendarSync:
             instance_event_data['is_recurring'] = False
             
             google_event = self._create_google_event(instance_event_data)
-            created_event = self.service.events().patch(
+            created_event = self._execute_with_retry(
+                self.service.events().patch,
                 calendarId=self.calendar_id,
                 eventId=master_recurring_event_map[event_data['uid']]['id'],
                 body=google_event
-            ).execute()
+            )
             logger.info(f"Patched recurring instance: {event_data['summary']}")
             return True
         except Exception as e:
@@ -959,10 +1131,11 @@ class CalendarSync:
         """Insert normal event."""
         try:
             google_event = self._create_google_event(event_data)
-            created_event = self.service.events().insert(
+            created_event = self._execute_with_retry(
+                self.service.events().insert,
                 calendarId=self.calendar_id,
                 body=google_event
-            ).execute()
+            )
             logger.info(f"Inserted normal event: {event_data['summary']}")
             return True
         except Exception as e:
@@ -1021,11 +1194,12 @@ class CalendarSync:
             # Only patch if there are changes
             if patch_data:
                 existing_event_id = existing_event['id']
-                updated_event = self.service.events().patch(
+                updated_event = self._execute_with_retry(
+                    self.service.events().patch,
                     calendarId=self.calendar_id,
                     eventId=existing_event_id,
                     body=patch_data
-                ).execute()
+                )
                 logger.info(f"Patched recurring instance: {event_data['summary']} with {len(patch_data)} fields")
                 return True
             else:
@@ -1064,12 +1238,13 @@ class CalendarSync:
             if event_data.get('is_recurring') and 'recurrence' in google_event:
                 logger.debug(f"Updating recurring event with recurrence rule: {google_event['recurrence']}")
             
-            # Update the event
-            updated_event = self.service.events().update(
+            # Update the event with retry mechanism
+            updated_event = self._execute_with_retry(
+                self.service.events().update,
                 calendarId=self.calendar_id,
                 eventId=event_id,
                 body=google_event
-            ).execute()
+            )
             
             logger.info(f"Updated event: {event_data['summary']}")
             return True
@@ -1180,7 +1355,7 @@ class CalendarSync:
         
         return google_event
     
-    def sync_calendar(self):
+    def sync_calendar(self, _init: bool = False):
         """Perform one sync cycle."""
         logger.info("Starting calendar sync cycle")
         
@@ -1194,7 +1369,7 @@ class CalendarSync:
             events = self.parse_ics_file(ics_file)
             
             # Import events
-            self.import_events_to_calendar(events)
+            self.import_events_to_calendar(events, _init)
             
         finally:
             # Clean up temporary file
@@ -1207,10 +1382,12 @@ class CalendarSync:
         logger.info(f"Starting continuous sync every {interval_minutes} minute(s)")
         
         try:
+            init = True
             while True:
-                self.sync_calendar()
+                self.sync_calendar(init)
                 logger.info(f"Waiting {interval_minutes} minute(s) before next sync...")
                 time.sleep(interval_minutes * 60)
+                # init = False
                 
         except KeyboardInterrupt:
             logger.info("Sync stopped by user")
