@@ -156,6 +156,7 @@ google_calendear_sync/
 ## Known Issues
 - Some recurring events may be mis-detected as being updated, causing some redundant event patching. But the script works correctly.
 - Some recurring insteance events may not have a master recurring event. We treat them as individual events and insert them separately. As a result, these events will be deleted and re-inserted in each iteration.
+- A more decent way to patching recurrent event is to search for the master recurrent event when finding there is a patching event. Will fix in the future.
 
 ## License
 This script is provided as-is for educational and personal use.
