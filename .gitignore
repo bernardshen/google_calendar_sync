@@ -4,5 +4,6 @@ token.json
 *.ics
 config.env
 *.log
+*.log.*
 __pycache__/
 .venv/
